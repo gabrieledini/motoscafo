@@ -180,6 +180,7 @@
     position: absolute; top: 0; left: 0; right: 0;
     padding: 12px 18px;
     display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 10px;
     z-index: 20;
     pointer-events: none;
     font-family: 'Press Start 2P', monospace;
@@ -206,6 +207,29 @@
     text-shadow: 0 0 6px rgba(216,243,255,0.5);
   }
   #best-block .hud-label { color: var(--gold); }
+
+  /* Bottone audio nell'HUD */
+  .hud-center {
+    pointer-events: auto;
+    display: flex; gap: 8px;
+  }
+  .icon-btn {
+    pointer-events: auto;
+    background: rgba(5,20,40,0.55);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border: 1px solid rgba(0,240,255,0.35);
+    border-radius: 4px;
+    width: 38px; height: 38px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    color: var(--accent);
+    box-shadow: 0 0 12px rgba(0,240,255,0.15), inset 0 0 8px rgba(0,240,255,0.1);
+    transition: transform 0.1s ease;
+  }
+  .icon-btn:active { transform: scale(0.92); }
+  .icon-btn svg { width: 20px; height: 20px; }
+  .icon-btn.muted { color: rgba(255,59,107,0.85); border-color: rgba(255,59,107,0.5); }
 
   /* Schermata iniziale e game over */
   .overlay {
@@ -357,6 +381,20 @@
       <div class="hud-label">TEMPO</div>
       <div class="hud-value" id="time-value">00:00</div>
     </div>
+    <div class="hud-center">
+      <button class="icon-btn" id="mute-btn" aria-label="Audio">
+        <svg id="icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor"/>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+        </svg>
+        <svg id="icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none;">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor"/>
+          <line x1="23" y1="9" x2="17" y2="15"/>
+          <line x1="17" y1="9" x2="23" y2="15"/>
+        </svg>
+      </button>
+    </div>
     <div class="hud-block" id="best-block">
       <div class="hud-label">RECORD</div>
       <div class="hud-value" id="best-value">00:00</div>
@@ -478,6 +516,360 @@
     return `${mm}:${ss}`;
   }
 
+  // ========================================================================
+  // AUDIO — Surf rock originale generato live via Web Audio API
+  // Stile: riff alla "surf rock" anni '60 (Dick Dale / Beach Boys vibe),
+  // giro armonico I–vi–IV–V in Mi maggiore, drum shuffle, basso camminato.
+  // ========================================================================
+  const Audio = (() => {
+    let ctx = null;
+    let masterGain = null;
+    let reverbBus = null;
+    let started = false;
+    let muted = (localStorage.getItem('occhio_scoglio_mute') === '1');
+    let schedulerId = null;
+    let nextNoteTime = 0;
+    let step = 0;            // step a sedicesimi nella battuta (0..15)
+    let bar = 0;             // numero di battuta corrente
+    const BPM = 138;          // tempo surf rock
+    const SECONDS_PER_16TH = 60 / BPM / 4;
+    const LOOKAHEAD = 0.1;    // s, quanto guardiamo avanti
+    const SCHEDULE_INTERVAL = 25; // ms
+
+    // Frequenze (Hz) — note che useremo
+    const N = {
+      E2: 82.41, A2: 110.00, B2: 123.47, Cs3: 138.59, D3: 146.83,
+      E3: 164.81, Fs3: 185.00, Gs3: 207.65, A3: 220.00, B3: 246.94,
+      Cs4: 277.18, D4: 293.66, E4: 329.63, Fs4: 369.99, Gs4: 415.30,
+      A4: 440.00, B4: 493.88, Cs5: 554.37, D5: 587.33, E5: 659.25,
+      Fs5: 739.99, Gs5: 830.61, A5: 880.00,
+    };
+
+    // Giro armonico (4 battute, in Mi maggiore): E – C#m – A – B
+    // Root note del basso per ogni battuta
+    const chordProg = [
+      { root: 'E2',  notes: ['E3','Gs3','B3','E4'], name: 'E'   },
+      { root: 'Cs3', notes: ['Cs3','E3','Gs3','Cs4'], name: 'C#m' },
+      { root: 'A2',  notes: ['A3','Cs4','E4','A4'], name: 'A'   },
+      { root: 'B2',  notes: ['B2','D3','Fs3','B3'], name: 'B'   },  // qui useremo Fs/Ds approx come tensione
+    ];
+
+    // Scala maggiore di E per la melodia (penta-blues approx)
+    const surfScale = ['E4','Fs4','Gs4','A4','B4','Cs5','D5','E5','Fs5','Gs5','A5'];
+
+    // Riff di lead a 16 step per battuta. -1 = pausa, altrimenti indice in surfScale
+    // 4 battute totali, alterniamo riff energico e risposta più dolce
+    const leadPatterns = [
+      // Battuta 1: riff su E maggiore (surf style ascendente)
+      [0,-1,2,-1, 4,-1,2,-1, 0,-1,4,-1, 5,4,2,0],
+      // Battuta 2: su C#m, scendiamo
+      [4,3,2,-1, 5,4,3,-1, 2,-1,3,-1, 4,-1,5,-1],
+      // Battuta 3: su A, ondulato
+      [3,-1,5,-1, 6,5,3,-1, 5,-1,6,-1, 7,6,5,3],
+      // Battuta 4: su B (turnaround, tensione)
+      [4,5,6,-1, 7,-1,6,5, 4,-1,5,-1, 4,3,2,0],
+    ];
+
+    function ensureContext() {
+      if (ctx) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+      masterGain = ctx.createGain();
+      masterGain.gain.value = muted ? 0 : 0.45;
+      masterGain.connect(ctx.destination);
+
+      // Bus riverbero (delay + feedback per simulare spring reverb surf)
+      const delay = ctx.createDelay(1.0);
+      delay.delayTime.value = 0.09;
+      const feedback = ctx.createGain();
+      feedback.gain.value = 0.32;
+      const reverbGain = ctx.createGain();
+      reverbGain.gain.value = 0.35;
+      delay.connect(feedback);
+      feedback.connect(delay);
+      delay.connect(reverbGain);
+      reverbGain.connect(masterGain);
+
+      reverbBus = ctx.createGain();
+      reverbBus.gain.value = 1.0;
+      reverbBus.connect(delay);
+      // anche segnale dry passa direttamente
+    }
+
+    // ----- Strumenti -----
+
+    // Chitarra surf: onda quadra/sega filtrata + tremolo + reverb
+    function pluck(freq, time, dur, gain = 0.18, withTremolo = true) {
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      osc1.type = 'sawtooth';
+      osc2.type = 'square';
+      osc1.frequency.value = freq;
+      osc2.frequency.value = freq * 1.005; // leggero detune
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 2200;
+      filter.Q.value = 4;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, time);
+      env.gain.exponentialRampToValueAtTime(gain, time + 0.008);
+      env.gain.exponentialRampToValueAtTime(gain * 0.6, time + 0.05);
+      env.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+
+      // tremolo (LFO sul gain) — firma surf rock
+      if (withTremolo) {
+        const tremLfo = ctx.createOscillator();
+        const tremGain = ctx.createGain();
+        tremLfo.frequency.value = 6.5;
+        tremGain.gain.value = 0.35;
+        tremLfo.connect(tremGain);
+        tremGain.connect(env.gain);
+        tremLfo.start(time);
+        tremLfo.stop(time + dur + 0.1);
+      }
+
+      osc1.connect(filter);
+      osc2.connect(filter);
+      filter.connect(env);
+      env.connect(masterGain);
+      env.connect(reverbBus);
+
+      osc1.start(time); osc2.start(time);
+      osc1.stop(time + dur + 0.05);
+      osc2.stop(time + dur + 0.05);
+    }
+
+    // Basso: triangolo morbido
+    function bass(freq, time, dur, gain = 0.32) {
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+
+      const sub = ctx.createOscillator();
+      sub.type = 'sine';
+      sub.frequency.value = freq / 2;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 600;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, time);
+      env.gain.exponentialRampToValueAtTime(gain, time + 0.01);
+      env.gain.exponentialRampToValueAtTime(gain * 0.5, time + 0.1);
+      env.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+
+      osc.connect(filter);
+      sub.connect(filter);
+      filter.connect(env);
+      env.connect(masterGain);
+
+      osc.start(time); sub.start(time);
+      osc.stop(time + dur + 0.05);
+      sub.stop(time + dur + 0.05);
+    }
+
+    // Kick drum
+    function kick(time, gain = 0.5) {
+      const osc = ctx.createOscillator();
+      osc.frequency.setValueAtTime(120, time);
+      osc.frequency.exponentialRampToValueAtTime(40, time + 0.12);
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(gain, time);
+      env.gain.exponentialRampToValueAtTime(0.0001, time + 0.18);
+      osc.connect(env);
+      env.connect(masterGain);
+      osc.start(time);
+      osc.stop(time + 0.2);
+    }
+
+    // Snare (noise + tono)
+    function snare(time, gain = 0.32) {
+      // noise
+      const bufSize = ctx.sampleRate * 0.2;
+      const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+      const noise = ctx.createBufferSource();
+      noise.buffer = buf;
+      const nFilt = ctx.createBiquadFilter();
+      nFilt.type = 'highpass';
+      nFilt.frequency.value = 1800;
+      const nEnv = ctx.createGain();
+      nEnv.gain.setValueAtTime(gain, time);
+      nEnv.gain.exponentialRampToValueAtTime(0.0001, time + 0.13);
+      noise.connect(nFilt); nFilt.connect(nEnv); nEnv.connect(masterGain);
+      noise.start(time); noise.stop(time + 0.15);
+
+      // body tone
+      const osc = ctx.createOscillator();
+      osc.frequency.value = 200;
+      const oEnv = ctx.createGain();
+      oEnv.gain.setValueAtTime(gain * 0.4, time);
+      oEnv.gain.exponentialRampToValueAtTime(0.0001, time + 0.08);
+      osc.connect(oEnv); oEnv.connect(masterGain);
+      osc.start(time); osc.stop(time + 0.1);
+    }
+
+    // Hi-hat (noise filtrato breve)
+    function hihat(time, gain = 0.12, open = false) {
+      const bufSize = ctx.sampleRate * 0.1;
+      const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+      const noise = ctx.createBufferSource();
+      noise.buffer = buf;
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'highpass';
+      filt.frequency.value = 7000;
+      const env = ctx.createGain();
+      const decay = open ? 0.16 : 0.04;
+      env.gain.setValueAtTime(gain, time);
+      env.gain.exponentialRampToValueAtTime(0.0001, time + decay);
+      noise.connect(filt); filt.connect(env); env.connect(masterGain);
+      noise.start(time); noise.stop(time + decay + 0.02);
+    }
+
+    // ----- Scheduler -----
+    function noteFromName(name) { return N[name] || 440; }
+
+    function scheduleStep(stepIdx, barIdx, time) {
+      const chord = chordProg[barIdx % 4];
+
+      // ----- Batteria (shuffle pattern) -----
+      // step in 16esimi: 0..15
+      // Kick: 0 e 8 (battiti forti), più 6 occasionale
+      if (stepIdx === 0 || stepIdx === 8) kick(time, 0.55);
+      if (stepIdx === 10 && barIdx % 2 === 1) kick(time, 0.35);
+
+      // Snare: 4 e 12 (backbeat)
+      if (stepIdx === 4 || stepIdx === 12) snare(time, 0.3);
+
+      // Hi-hat: ogni 8esimo (step pari), open su 14 fine battuta
+      if (stepIdx % 2 === 0) hihat(time, 0.10, false);
+      if (stepIdx === 14 && barIdx % 4 === 3) hihat(time, 0.16, true);
+
+      // ----- Basso: nota di root su 0, 6, 8, 14 (cammina) -----
+      if (stepIdx === 0)  bass(noteFromName(chord.root), time, 0.35, 0.32);
+      if (stepIdx === 8)  bass(noteFromName(chord.root), time, 0.30, 0.28);
+      if (stepIdx === 12) {
+        // nota di passaggio (terza dell'accordo, ottava giù)
+        const passing = noteFromName(chord.notes[1]) / 2;
+        bass(passing, time, 0.22, 0.22);
+      }
+
+      // ----- Accordi di chitarra (rhythm): chord stab su 0, 4, 8, 12 -----
+      if (stepIdx % 4 === 0) {
+        const voicing = chord.notes;
+        for (let i = 0; i < voicing.length; i++) {
+          pluck(noteFromName(voicing[i]), time + i * 0.005, 0.35, 0.06, true);
+        }
+      }
+
+      // ----- Melodia di lead (riff surf) -----
+      const pattern = leadPatterns[barIdx % 4];
+      const idx = pattern[stepIdx];
+      if (idx >= 0) {
+        const noteName = surfScale[idx];
+        // ogni 4 battute (loop completo), variamo leggermente per non essere statici
+        const variation = (Math.floor(barIdx / 4) % 2 === 1 && stepIdx === 10) ? 0.95 : 1.0;
+        pluck(noteFromName(noteName) * variation, time, 0.22, 0.13, true);
+      }
+    }
+
+    function scheduler() {
+      while (nextNoteTime < ctx.currentTime + LOOKAHEAD) {
+        scheduleStep(step, bar, nextNoteTime);
+        step++;
+        if (step >= 16) {
+          step = 0;
+          bar++;
+        }
+        nextNoteTime += SECONDS_PER_16TH;
+      }
+    }
+
+    function start() {
+      ensureContext();
+      if (ctx.state === 'suspended') ctx.resume();
+      if (started) return;
+      started = true;
+      step = 0; bar = 0;
+      nextNoteTime = ctx.currentTime + 0.1;
+      schedulerId = setInterval(scheduler, SCHEDULE_INTERVAL);
+    }
+
+    function stop() {
+      if (!started) return;
+      started = false;
+      if (schedulerId) { clearInterval(schedulerId); schedulerId = null; }
+      // breve fade per non avere click
+      if (masterGain) {
+        const now = ctx.currentTime;
+        const cur = masterGain.gain.value;
+        masterGain.gain.cancelScheduledValues(now);
+        masterGain.gain.setValueAtTime(cur, now);
+        masterGain.gain.linearRampToValueAtTime(0.0001, now + 0.15);
+        setTimeout(() => {
+          if (!started && masterGain) {
+            masterGain.gain.value = muted ? 0 : 0.45;
+          }
+        }, 200);
+      }
+    }
+
+    function setMuted(m) {
+      muted = m;
+      localStorage.setItem('occhio_scoglio_mute', m ? '1' : '0');
+      if (masterGain && ctx) {
+        const now = ctx.currentTime;
+        masterGain.gain.cancelScheduledValues(now);
+        masterGain.gain.linearRampToValueAtTime(m ? 0 : 0.45, now + 0.1);
+      }
+    }
+    function isMuted() { return muted; }
+    function toggleMute() { setMuted(!muted); return muted; }
+
+    // Effetto di crash sul game over
+    function crash() {
+      ensureContext();
+      const t = ctx.currentTime;
+      // boato bassissimo
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(150, t);
+      osc.frequency.exponentialRampToValueAtTime(40, t + 0.6);
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.5, t);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + 0.7);
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.value = 900;
+      osc.connect(filt); filt.connect(env); env.connect(masterGain || ctx.destination);
+      osc.start(t); osc.stop(t + 0.75);
+      // splash di rumore
+      const bufSize = ctx.sampleRate * 0.7;
+      const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+      const noise = ctx.createBufferSource();
+      noise.buffer = buf;
+      const nf = ctx.createBiquadFilter();
+      nf.type = 'bandpass';
+      nf.frequency.value = 2000;
+      const ng = ctx.createGain();
+      ng.gain.value = 0.35;
+      noise.connect(nf); nf.connect(ng); ng.connect(masterGain || ctx.destination);
+      noise.start(t); noise.stop(t + 0.7);
+    }
+
+    return { start, stop, setMuted, isMuted, toggleMute, crash, ensureContext };
+  })();
+
+  // ========================================================================
+
   function startGame() {
     state = 'playing';
     elapsed = 0;
@@ -492,6 +884,7 @@
     boat.targetY = boat.y;
     startOverlay.classList.add('hidden');
     gameoverOverlay.classList.add('hidden');
+    Audio.start();
     lastT = performance.now();
     requestAnimationFrame(loop);
   }
@@ -513,6 +906,8 @@
       });
     }
     shakeAmt = 18;
+    Audio.stop();
+    Audio.crash();
     finalTime.textContent = fmtTime(elapsed);
     if (elapsed > bestTime) {
       bestTime = elapsed;
@@ -869,6 +1264,25 @@
 
   startBtn.addEventListener('click', startGame);
   retryBtn.addEventListener('click', startGame);
+
+  // Bottone audio
+  const muteBtn = document.getElementById('mute-btn');
+  const iconOn = document.getElementById('icon-on');
+  const iconOff = document.getElementById('icon-off');
+  function refreshMuteIcon() {
+    const m = Audio.isMuted();
+    iconOn.style.display = m ? 'none' : '';
+    iconOff.style.display = m ? '' : 'none';
+    muteBtn.classList.toggle('muted', m);
+  }
+  refreshMuteIcon();
+  muteBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // primo click inizializza il context (autoplay policy)
+    Audio.ensureContext();
+    Audio.toggleMute();
+    refreshMuteIcon();
+  });
 
   // Previeni scroll su iOS quando si tocca il canvas
   document.body.addEventListener('touchmove', (e) => {
